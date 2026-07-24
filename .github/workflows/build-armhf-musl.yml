@@ -38,12 +38,10 @@ jobs:
             --env DEBIAN_FRONTEND=noninteractive \
             ${IMAGE} bash -lc '
               set -euo pipefail
-              # Replace sources.list to use the Debian archive for Jessie (old release)
-              cat > /etc/apt/sources.list <<'"'"'EOF'"'"'
-              deb http://archive.debian.org/debian jessie main contrib non-free
-              deb http://archive.debian.org/debian-security jessie/updates main contrib non-free
-              deb http://archive.debian.org/debian jessie-updates main contrib non-free
-              EOF
+              # Use archive.debian.org for old Jessie packages (avoid heredoc quoting)
+              echo "deb http://archive.debian.org/debian jessie main contrib non-free" > /etc/apt/sources.list
+              echo "deb http://archive.debian.org/debian-security jessie/updates main contrib non-free" >> /etc/apt/sources.list
+              echo "deb http://archive.debian.org/debian jessie-updates main contrib non-free" >> /etc/apt/sources.list
               # Disable the "Valid-Until" check for old Release files
               echo "Acquire::Check-Valid-Until false;" > /etc/apt/apt.conf.d/99no-check-valid-until
 
@@ -89,14 +87,25 @@ jobs:
               export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
               export C_INCLUDE_PATH=/usr/local/include:$C_INCLUDE_PATH
               # Run cargo build (this will create target/release because we build natively)
-              cargo build --release --features "${DEP_FEATURES}"
+              if ! cargo build --release --features "${DEP_FEATURES}"; then
+                echo "cargo build failed; dumping cargo tree and target/release listing for diagnostics"
+                cargo tree || true
+                ls -la target || true
+                exit 2
+              fi
 
               # Show produced binary
               echo "Built artifacts under target/release:"
               ls -la target/release || true
 
-              # Make sure the binary is world-readable in the mounted workspace
-              chmod -R ar target/release || true
+              # Ensure artifacts are copied into the mounted workspace top-level artifacts/ folder
+              mkdir -p /work/artifacts
+              cp -a target/release/* /work/artifacts/ 2>/dev/null || true
+              echo "Copied artifacts to /work/artifacts/"
+              ls -la /work/artifacts || true
+
+              # Make sure the copied artifacts are world-readable
+              chmod -R ar /work/artifacts || true
             '
       - name: Collect and show produced binary
         run: |
