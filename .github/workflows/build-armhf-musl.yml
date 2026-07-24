@@ -68,18 +68,30 @@ jobs:
             echo 'glibc version inside chroot:'
             ldd --version | head -n 1 || true
 
+            # Build a modern CMake from source (Jessie's cmake is too old for libolm)
+            CMAKE_VERSION=3.22.0
+            echo "Building CMake ${CMAKE_VERSION} from source (this may take several minutes)..."
+            rm -rf /tmp/cmake-src
+            cd /tmp
+            apt-get install -y --no-install-recommends libssl-dev || true
+            curl -fsSL -o cmake.tar.gz https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}.tar.gz
+            tar xf cmake.tar.gz
+            cd cmake-${CMAKE_VERSION}
+            ./bootstrap --prefix=/usr/local || (echo "cmake bootstrap failed" && exit 5)
+            make -j\$(nproc) || (echo "cmake make failed" && exit 6)
+            make install || (echo "cmake install failed" && exit 7)
+            /usr/local/bin/cmake --version || true
+
             # Build libolm (static)
             echo 'Cloning and building libolm...'
             rm -rf /tmp/olm
             git clone --depth 1 https://gitlab.matrix.org/matrix-org/olm.git /tmp/olm
             mkdir -p /tmp/olm/build
             cd /tmp/olm/build
-            cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+            /usr/local/bin/cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
             make -j\$(nproc)
             make install
-            ls -la /usr/local/lib/libolm.a || true
-            ls -la /usr/local/include/olm || true
-
+            
             # Install rustup and Rust toolchain inside chroot (armhf)
             echo 'Installing rustup in chroot...'
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
