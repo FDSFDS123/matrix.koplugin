@@ -20,7 +20,7 @@ jobs:
           # Target triple
           TARGET=armv7-unknown-linux-musleabihf
           # Use the official messense cross image for armv7 musl
-          IMAGE=messense/rust-musl-cross:${TARGET}
+          IMAGE=messense/rust-musl-cross:latest
           echo "Using image: $IMAGE"
 
           docker run --rm -v "${GITHUB_WORKSPACE}":/work -w /work --platform linux/amd64 $IMAGE bash -lc '
