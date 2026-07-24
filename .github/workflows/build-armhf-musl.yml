@@ -1,4 +1,4 @@
-name: Build linux-armv7-musleabihf (cross) with E2EE
+name: Build linux-armv7-musleabihf (cross + vendored libolm)
 
 on:
   workflow_dispatch:
@@ -6,8 +6,12 @@ on:
     branches:
       - main
 
+env:
+  # Target triple
+  TARGET: armv7-unknown-linux-musleabihf
+
 jobs:
-  build-with-cross:
+  build:
     runs-on: ubuntu-latest
     env:
       CARGO_TERM_COLOR: always
@@ -16,7 +20,7 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v5
 
-      - name: Install Rust toolchain
+      - name: Set up Rust toolchain
         uses: actions-rs/toolchain@v1
         with:
           toolchain: stable
@@ -25,46 +29,82 @@ jobs:
       - name: Install cross (cargo install)
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          # Install cross; the version may be updated later if desired
           cargo install --locked cross || true
           cross --version || echo "cross not available yet"
 
-      - name: Build for armv7-unknown-linux-musleabihf with cross
+      - name: Prepare vendor directory for libolm
+        run: |
+          mkdir -p olm-target/include olm-target/lib
+          ls -la olm-target || true
+
+      - name: Build libolm for armv7-musl (dockcross/musleabihf)
+        run: |
+          # This step attempts to build libolm for the musl armv7 target using a musl cross container.
+          # The image name dockcross/musleabihf is used because it typically provides an armv7 musl toolchain.
+          # If the image cannot be found on Docker Hub, the step will fail and we will iterate.
+          echo "Attempting to build libolm for target ${TARGET} using dockcross/musleabihf"
+          docker run --rm -v "${GITHUB_WORKSPACE}":/work -w /work --platform linux/amd64 dockcross/musleabihf:latest bash -lc '
+            set -euo pipefail
+            apt-get update -y
+            apt-get install -y --no-install-recommends cmake git pkg-config build-essential ca-certificates
+            # Work in a clean temp directory
+            TMP=/tmp/olm_build
+            rm -rf $TMP
+            git clone --depth 1 https://gitlab.matrix.org/matrix-org/olm.git $TMP
+            mkdir -p $TMP/build
+            cd $TMP/build
+            # Use a static build (no shared libs)
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+            make -j"$(nproc)"
+            # Copy static archive and headers into mounted workspace (olm-target)
+            mkdir -p /work/olm-target/lib /work/olm-target/include
+            cp libolm.a /work/olm-target/lib/libolm.a
+            cp -r ../include /work/olm-target/include
+            echo "Copied libolm.a and headers to /work/olm-target"
+          ' || (echo "Primary libolm build attempt failed; printing diagnostic info" && ls -la olm-target || true && exit 1)
+
+      - name: Inspect vendored libolm artifacts
+        run: |
+          echo "olm-target contents:"
+          ls -la olm-target || true
+          file olm-target/lib/* || true
+          echo "Head of an example header:"
+          head -n 40 olm-target/include/olm/* || true
+
+      - name: Build Rust binary with cross, linking vendored libolm
         env:
-          RUSTFLAGS: ""
-          # If you vendor libolm or provide a custom path, set:
-          # LIBOLM_DIR: ${{ github.workspace }}/olm-target
+          PATH: ${{ github.workspace }}/.cargo/bin:$PATH
+          # Tell the linker where to find vendored static library and headers
+          LIBRARY_PATH: ${{ github.workspace }}/olm-target/lib:$LIBRARY_PATH
+          C_INCLUDE_PATH: ${{ github.workspace }}/olm-target/include:$C_INCLUDE_PATH
+          PKG_CONFIG_PATH: ${{ github.workspace }}/olm-target/lib/pkgconfig:$PKG_CONFIG_PATH
         run: |
           export PATH="$HOME/.cargo/bin:$PATH"
-          TARGET=armv7-unknown-linux-musleabihf
-          FEATURES="encryption sled_cryptostore"
-          echo "Building target ${TARGET} with features: ${FEATURES}"
+          TARGET=${{ env.TARGET }}
+          # Enable matrix-sdk dependency features explicitly (dependency-qualified)
+          DEP_FEATURES="matrix-sdk/encryption matrix-sdk/sled_cryptostore"
+          echo "Running cross build for ${TARGET} with dependency features: ${DEP_FEATURES}"
+          # Print environment to help debugging
+          echo "LIBRARY_PATH=$LIBRARY_PATH"
+          echo "C_INCLUDE_PATH=$C_INCLUDE_PATH"
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
+          # Try the cross build
+          cross build --release --target ${TARGET} --features "${DEP_FEATURES}"
 
-          # If you need to vendor a prebuilt libolm static lib for the target, ensure
-          # it is available under $LIBOLM_DIR/lib (libolm.a) and headers under $LIBOLM_DIR/include.
-          # To instruct the C linker to find it you can set:
-          # export LIBRARY_PATH="${LIBOLM_DIR}/lib:$LIBRARY_PATH"
-          # export C_INCLUDE_PATH="${LIBOLM_DIR}/include:$C_INCLUDE_PATH"
-          #
-          # NOTE: If libolm is not present in the cross container images used by cross,
-          # the build will likely fail with linking/compile errors. If that happens,
-          # we can:
-          #  - Add a preceding step that runs a container for the target and builds libolm,
-          #    copying the static lib + headers into a repo directory (olm-target) that the
-          #    subsequent cross run picks up via mounted workspace.
-          #  - Or publish a custom cross image with libolm preinstalled and configure cross
-          #    to use that image.
-          #
-          # Try the cross build now:
-          cross build --release --target ${TARGET} --features "${FEATURES}"
-
-      - name: Show produced artifacts (if any)
+      - name: Show produced artifacts
         run: |
-          ls -la target/armv7-unknown-linux-musleabihf/release || true
-          file target/armv7-unknown-linux-musleabihf/release/* || true
+          echo "Listing produced artifacts (target/${{ env.TARGET }}/release)"
+          ls -la target/${{ env.TARGET }}/release || true
+          file target/${{ env.TARGET }}/release/* || true
 
-      - name: Upload artifact
+      - name: Upload binary artifact
         uses: actions/upload-artifact@v5
         with:
           name: matrix-helper-linux-armv7-musleabihf
-          path: target/armv7-unknown-linux-musleabihf/release/*
+          path: target/${{ env.TARGET }}/release/*
+
+      - name: Upload vendored libolm (for debugging)
+        uses: actions/upload-artifact@v5
+        with:
+          name: olm-target
+          path: olm-target
