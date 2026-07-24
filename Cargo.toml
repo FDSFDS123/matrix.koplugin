@@ -1,0 +1,18 @@
+[package]
+name = "matrix-helper"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+axum = "0.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+anyhow = "1.0"
+
+# matrix-rust-sdk: pick a version and enable encryption + a persistent store.
+# If the version you have in your environment uses different feature names, update accordingly.
+matrix-sdk = { version = "0.7", features = ["encryption", "sled_cryptostore", "reqwest_backend"] }
+ruma = "0.7"
