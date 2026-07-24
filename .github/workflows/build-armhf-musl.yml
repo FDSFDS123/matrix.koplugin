@@ -27,7 +27,6 @@ jobs:
           uname -a
           lsb_release -a || true
           docker --version
-
       - name: Build inside emulated armhf Debian Jessie (glibc 2.19)
         # We mount the repo into /work so produced target/release ends up in the workflow workspace.
         run: |
@@ -39,7 +38,17 @@ jobs:
             --env DEBIAN_FRONTEND=noninteractive \
             ${IMAGE} bash -lc '
               set -euo pipefail
-              apt-get update -y
+              # Replace sources.list to use the Debian archive for Jessie (old release)
+              cat > /etc/apt/sources.list <<'"'"'EOF'"'"'
+              deb http://archive.debian.org/debian jessie main contrib non-free
+              deb http://archive.debian.org/debian-security jessie/updates main contrib non-free
+              deb http://archive.debian.org/debian jessie-updates main contrib non-free
+              EOF
+              # Disable the "Valid-Until" check for old Release files
+              echo "Acquire::Check-Valid-Until false;" > /etc/apt/apt.conf.d/99no-check-valid-until
+
+              # Update using archive.debian.org (disable valid-until check while updating)
+              apt-get -o Acquire::Check-Valid-Until=false update -y || true
               apt-get install -y --no-install-recommends \
                 build-essential cmake git pkg-config curl ca-certificates libssl-dev python3 \
                 autoconf automake libtool gettext
@@ -65,7 +74,7 @@ jobs:
               # Install rustup and toolchain (native armhf inside the container)
               echo "Installing rustup..."
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-              chmod +x /tmp/rustup-init.sh
+              chmod x /tmp/rustup-init.sh
               /tmp/rustup-init.sh -y --no-modify-path
               export PATH=$HOME/.cargo/bin:$PATH
               rustup default stable
@@ -79,8 +88,7 @@ jobs:
               export LIBRARY_PATH=/usr/local/lib:$LIBRARY_PATH
               export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
               export C_INCLUDE_PATH=/usr/local/include:$C_INCLUDE_PATH
-              # Run cargo build (this will create target/armv7-unknown-linux-gnueabihf/release if target dir is set,
-              # but since we build natively, target/release will be produced)
+              # Run cargo build (this will create target/release because we build natively)
               cargo build --release --features "${DEP_FEATURES}"
 
               # Show produced binary
@@ -88,9 +96,8 @@ jobs:
               ls -la target/release || true
 
               # Make sure the binary is world-readable in the mounted workspace
-              chmod -R a+r target/release || true
+              chmod -R ar target/release || true
             '
-
       - name: Collect and show produced binary
         run: |
           echo "Workspace target/release listing (host):"
