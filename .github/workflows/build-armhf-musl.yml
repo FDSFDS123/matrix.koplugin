@@ -1,4 +1,4 @@
-name: Build linux-armv7 (armhf) with glibc < 2.20 (Debian Jessie / glibc 2.19)
+name: Build linux-armhf (armv7) with glibc < 2.20 via debootstrap + qemu
 
 on:
   workflow_dispatch:
@@ -7,114 +7,121 @@ on:
       - main
 
 jobs:
-  build-armhf-jessie:
+  build-armhf-jessie-debootstrap:
     runs-on: ubuntu-latest
     env:
-      # target triple for native build inside armhf container
       TARGET: armv7-unknown-linux-gnueabihf
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v5
 
-      - name: Set up QEMU (multiarch/binfmt) for emulation
-        uses: docker/setup-qemu-action@v2
-        with:
-          platforms: linux/arm/v7
-
-      - name: Show runner info
+      - name: Install host prerequisites (debootstrap, qemu)
         run: |
-          uname -a
-          lsb_release -a || true
-          docker --version
-      - name: Build inside emulated armhf Debian Jessie (glibc 2.19)
-        # We mount the repo into /work so produced target/release ends up in the workflow workspace.
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends debootstrap qemu-user-static binfmt-support rsync
+
+      - name: Prepare armhf rootfs (Debian Jessie) with debootstrap
         run: |
           set -euo pipefail
-          IMAGE=arm32v7/debian:jessie
-          echo "Using container image: $IMAGE (emulated armhf via qemu)"
-          docker run --rm --platform linux/arm/v7 \
-            -v "${GITHUB_WORKSPACE}":/work -w /work \
-            --env DEBIAN_FRONTEND=noninteractive \
-            ${IMAGE} bash -lc '
-              set -euo pipefail
-              # Use archive.debian.org for old Jessie packages (avoid heredoc quoting)
-              echo "deb http://archive.debian.org/debian jessie main contrib non-free" > /etc/apt/sources.list
-              echo "deb http://archive.debian.org/debian-security jessie/updates main contrib non-free" >> /etc/apt/sources.list
-              echo "deb http://archive.debian.org/debian jessie-updates main contrib non-free" >> /etc/apt/sources.list
-              # Disable the "Valid-Until" check for old Release files
-              echo "Acquire::Check-Valid-Until false;" > /etc/apt/apt.conf.d/99no-check-valid-until
+          ROOTFS="$RUNNER_TEMP/jessie-rootfs"
+          echo "Preparing rootfs at $ROOTFS"
+          sudo rm -rf "$ROOTFS"
+          sudo mkdir -p "$ROOTFS"
 
-              # Update using archive.debian.org (disable valid-until check while updating)
-              apt-get -o Acquire::Check-Valid-Until=false update -y || true
-              apt-get install -y --no-install-recommends \
-                build-essential cmake git pkg-config curl ca-certificates libssl-dev python3 \
-                autoconf automake libtool gettext
+          # First-stage bootstrap for armhf; use archive.debian.org to get old packages
+          sudo debootstrap --arch=armhf --foreign jessie "$ROOTFS" http://archive.debian.org/debian || {
+            echo "debootstrap first-stage failed"
+            exit 2
+          }
 
-              # Print glibc version to confirm target runtime (should be 2.19.x)
-              echo "glibc version on build container:"
-              ldd --version | head -n 1 || true
+          # Copy qemu user static binary so the chroot can run ARM binaries under qemu
+          sudo cp /usr/bin/qemu-arm-static "$ROOTFS"/usr/bin/
 
-              # Build libolm (static) from upstream
-              echo "Cloning and building libolm..."
-              git clone --depth 1 https://gitlab.matrix.org/matrix-org/olm.git /tmp/olm
-              mkdir -p /tmp/olm/build
-              cd /tmp/olm/build
-              cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
-              make -j"$(nproc)"
-              # install static lib and headers into /usr/local so linker finds them
-              make install
+          # Bind-mount the repository into the rootfs at /work so builds write directly to the runner workspace
+          sudo mkdir -p "$ROOTFS"/work
+          sudo mount --bind "${GITHUB_WORKSPACE}" "$ROOTFS"/work
 
-              # Verify libolm static lib present
-              ls -la /usr/local/lib/libolm.a || true
-              ls -la /usr/local/include/olm || true
+          # Run second stage inside chroot using qemu-arm-static
+          sudo chroot "$ROOTFS" /usr/bin/qemu-arm-static /bin/bash -lc "
+            set -euo pipefail
 
-              # Install rustup and toolchain (native armhf inside the container)
-              echo "Installing rustup..."
-              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-              chmod x /tmp/rustup-init.sh
-              /tmp/rustup-init.sh -y --no-modify-path
-              export PATH=$HOME/.cargo/bin:$PATH
-              rustup default stable
-              rustup component add rustfmt || true
+            # configure apt to use archive and ignore valid-until/signature checks (CI-only)
+            echo 'deb http://archive.debian.org/debian jessie main contrib non-free' > /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian-security jessie/updates main contrib non-free' >> /etc/apt/sources.list
+            echo 'deb http://archive.debian.org/debian jessie-updates main contrib non-free' >> /etc/apt/sources.list
 
-              # Build the Rust helper natively in this armhf container
-              # Enable dependency features explicitly (dependency-qualified) for matrix-sdk
-              DEP_FEATURES="matrix-sdk/encryption matrix-sdk/sled_cryptostore"
-              echo "Building Rust binary (native) with features: ${DEP_FEATURES}"
-              # Ensure environment can find libolm (installed to /usr/local)
-              export LIBRARY_PATH=/usr/local/lib:$LIBRARY_PATH
-              export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
-              export C_INCLUDE_PATH=/usr/local/include:$C_INCLUDE_PATH
-              # Run cargo build (this will create target/release because we build natively)
-              if ! cargo build --release --features "${DEP_FEATURES}"; then
-                echo "cargo build failed; dumping cargo tree and target/release listing for diagnostics"
-                cargo tree || true
-                ls -la target || true
-                exit 2
-              fi
+            cat > /etc/apt/apt.conf.d/99allow-insecure <<'CONF'
+Acquire::Check-Valid-Until "false";
+Acquire::AllowInsecureRepositories "true";
+Acquire::AllowDowngradeToInsecureRepositories "true";
+APT::Get::AllowUnauthenticated "true";
+CONF
 
-              # Show produced binary
-              echo "Built artifacts under target/release:"
-              ls -la target/release || true
+            # Finish debootstrap
+            /debootstrap/debootstrap --second-stage || (echo 'debootstrap second-stage failed' && exit 3)
 
-              # Ensure artifacts are copied into the mounted workspace top-level artifacts/ folder
-              mkdir -p /work/artifacts
-              cp -a target/release/* /work/artifacts/ 2>/dev/null || true
-              echo "Copied artifacts to /work/artifacts/"
-              ls -la /work/artifacts || true
+            # update and install build deps (allow unauthenticated because signatures are expired)
+            apt-get -o Acquire::Check-Valid-Until=false update -y || true
+            apt-get install -y --allow-unauthenticated --no-install-recommends \
+              build-essential cmake git pkg-config curl ca-certificates libssl-dev python3 \
+              autoconf automake libtool gettext
 
-              # Make sure the copied artifacts are world-readable
-              chmod -R ar /work/artifacts || true
-            '
-      - name: Collect and show produced binary
+            echo 'glibc version inside chroot:'
+            ldd --version | head -n 1 || true
+
+            # Build libolm (static)
+            echo 'Cloning and building libolm...'
+            rm -rf /tmp/olm
+            git clone --depth 1 https://gitlab.matrix.org/matrix-org/olm.git /tmp/olm
+            mkdir -p /tmp/olm/build
+            cd /tmp/olm/build
+            cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
+            make -j\$(nproc)
+            make install
+            ls -la /usr/local/lib/libolm.a || true
+            ls -la /usr/local/include/olm || true
+
+            # Install rustup and Rust toolchain inside chroot (armhf)
+            echo 'Installing rustup in chroot...'
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
+            chmod +x /tmp/rustup-init.sh
+            /tmp/rustup-init.sh -y --no-modify-path
+            export PATH=\"/root/.cargo/bin:\$PATH\"
+            rustup default stable || true
+            # Build the Rust helper inside the chroot; repository is mounted at /work
+            cd /work
+            export LIBRARY_PATH=/usr/local/lib:\$LIBRARY_PATH
+            export LD_LIBRARY_PATH=/usr/local/lib:\$LD_LIBRARY_PATH
+            export C_INCLUDE_PATH=/usr/local/include:\$C_INCLUDE_PATH
+            DEP_FEATURES='matrix-sdk/encryption matrix-sdk/sled_cryptostore'
+            echo 'Running cargo build (inside chroot) with dependency features:' \$DEP_FEATURES
+            if ! cargo build --release --features \"\$DEP_FEATURES\"; then
+              echo 'cargo build FAILED inside chroot; printing diagnostics'
+              cargo tree || true
+              ls -la target || true
+              exit 4
+            fi
+
+            echo 'Build completed inside chroot; listing artifacts:'
+            ls -la /work/target/release || true
+
+            # Ensure produced artifacts in /work are world readable (host workspace mount)
+            chmod -R a+r /work/target/release || true
+          "
+
+          # Unmount the workspace bind to avoid leaving mounts
+          sudo umount "$ROOTFS"/work || true
+          echo "Chroot build done; artifacts should be in ${GITHUB_WORKSPACE}/target/release"
+      
+      - name: List produced artifacts (host)
         run: |
-          echo "Workspace target/release listing (host):"
+          echo "Host workspace listing of built artifacts:"
           ls -la target/release || true
           file target/release/* || true
 
-      - name: Upload artifact (armhf binary built on Jessie / glibc 2.19)
+      - name: Upload artifact (armhf jessie / glibc < 2.20)
         uses: actions/upload-artifact@v5
         with:
-          name: matrix-helper-linux-armhf-glibc-2.19
+          name: matrix-helper-linux-armhf-glibc-<2.20
           path: target/release/*
