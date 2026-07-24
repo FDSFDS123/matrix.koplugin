@@ -1,4 +1,4 @@
-name: Build linux-armv7-musleabihf (musl static) with E2EE
+name: Build linux-armv7-musleabihf (cross) with E2EE
 
 on:
   workflow_dispatch:
@@ -7,51 +7,64 @@ on:
       - main
 
 jobs:
-  build-musl-armv7:
+  build-with-cross:
     runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Run musl cross container to build libolm + Rust binary
-        # Using messense/rust-musl-cross which provides cross toolchains including armv7-musleabihf
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install cross (cargo install)
         run: |
-          set -euo pipefail
-          # Target triple
+          export PATH="$HOME/.cargo/bin:$PATH"
+          # Install cross; the version may be updated later if desired
+          cargo install --locked cross || true
+          cross --version || echo "cross not available yet"
+
+      - name: Build for armv7-unknown-linux-musleabihf with cross
+        env:
+          RUSTFLAGS: ""
+          # If you vendor libolm or provide a custom path, set:
+          # LIBOLM_DIR: ${{ github.workspace }}/olm-target
+        run: |
+          export PATH="$HOME/.cargo/bin:$PATH"
           TARGET=armv7-unknown-linux-musleabihf
-          # Use the official messense cross image for armv7 musl
-          IMAGE=messense/rust-musl-cross:latest
-          echo "Using image: $IMAGE"
+          FEATURES="encryption sled_cryptostore"
+          echo "Building target ${TARGET} with features: ${FEATURES}"
 
-          docker run --rm -v "${GITHUB_WORKSPACE}":/work -w /work --platform linux/amd64 $IMAGE bash -lc '
-            set -euo pipefail
+          # If you need to vendor a prebuilt libolm static lib for the target, ensure
+          # it is available under $LIBOLM_DIR/lib (libolm.a) and headers under $LIBOLM_DIR/include.
+          # To instruct the C linker to find it you can set:
+          # export LIBRARY_PATH="${LIBOLM_DIR}/lib:$LIBRARY_PATH"
+          # export C_INCLUDE_PATH="${LIBOLM_DIR}/include:$C_INCLUDE_PATH"
+          #
+          # NOTE: If libolm is not present in the cross container images used by cross,
+          # the build will likely fail with linking/compile errors. If that happens,
+          # we can:
+          #  - Add a preceding step that runs a container for the target and builds libolm,
+          #    copying the static lib + headers into a repo directory (olm-target) that the
+          #    subsequent cross run picks up via mounted workspace.
+          #  - Or publish a custom cross image with libolm preinstalled and configure cross
+          #    to use that image.
+          #
+          # Try the cross build now:
+          cross build --release --target ${TARGET} --features "${FEATURES}"
 
-            apt-get update -y
-            apt-get install -y --no-install-recommends cmake pkg-config git ca-certificates build-essential
-
-            # Build libolm from upstream and install statically into /usr/local (the toolchain will pick it)
-            git clone --depth 1 https://gitlab.matrix.org/matrix-org/olm.git /tmp/olm
-            mkdir -p /tmp/olm/build
-            cd /tmp/olm/build
-            # Use the cross-compiler that messense image provides
-            export CC=arm-linux-musleabihf-gcc
-            export CXX=arm-linux-musleabihf-g++
-            export AR=arm-linux-musleabihf-ar
-            export RANLIB=arm-linux-musleabihf-ranlib
-            cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
-            make -j"$(nproc)"
-            make install
-
-            # Build Rust binary for the target. Ensure target is added by rustup in the image.
-            export RUSTFLAGS="-C target-feature=+v7,+thumb2"
-            cargo build --release --target '"$TARGET"' --features "encryption sled_cryptostore"
-
-            echo "Build finished. Binaries available in target/$TARGET/release/"
-          '
+      - name: Show produced artifacts (if any)
+        run: |
+          ls -la target/armv7-unknown-linux-musleabihf/release || true
+          file target/armv7-unknown-linux-musleabihf/release/* || true
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: matrix-helper-linux-armv7-musleabihf
-          path: |
-            target/armv7-unknown-linux-musleabihf/release/*
+          path: target/armv7-unknown-linux-musleabihf/release/*
