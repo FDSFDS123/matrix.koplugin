@@ -1,18 +1,20 @@
 local Widget = require("ui/widget/widget")
 local UIManager = require("ui/uimanager")
 local InfoMessage = require("ui/widget/infomessage")
-local TextViewer = require("ui/widget/textviewer")
 local InputDialog = require("ui/widget/inputdialog")
+local ConfirmBox = require("ui/widget/confirmbox") -- NEW IMPORT
 local LuaSettings = require("luasettings")
 local DataStorage = require("datastorage")
 local _ = require("gettext")
 local Menu = require("ui/widget/menu")
--- Built-in networking and JSON dependencies
-local https = require("ssl.https")
+
+-- Use standard socket.http since the daemon runs locally unencrypted
+local http = require("socket.http")
 local ltn12 = require("ltn12")
 local socketutil = require("socketutil")
 local rapidjson = require("rapidjson")
--- Emoji mapping table: maps Unicode characters & standard reactions to text shortcodes
+
+-- Emoji mapping table: maps Unicode characters & standard reactions to text shortcodes[cite: 1]
 local EMOJI_MAP = {
     ["👍"] = ":thumbsup:",
     ["❤️"] = ":heart:",
@@ -27,28 +29,24 @@ local EMOJI_MAP = {
     ["❌"] = ":x:",
 }
 
--- Convert raw emojis in any text string into safely displayable :shortcodes:
+-- Convert raw emojis in any text string into safely displayable :shortcodes:[cite: 1]
 local function sanitizeEmojiText(str)
     if not str or str == "" then return "" end
-    
-    -- Replace mapped unicode characters
     for emoji, shortcode in pairs(EMOJI_MAP) do
         str = str:gsub(emoji, shortcode)
     end
-    
     return str
 end
+
 local Matrix = Widget:extend{
     name = "matrix",
     is_doc_only = false,
 
-    -- Global Default Server & Fallback Credentials
-    homeserver = "HOMESERVER",
-    access_token = "*****ACCESSTOKENNEEDED*****",
+    -- Point directly to the Rust E2EE Daemon
+    daemon_url = "http://127.0.0.1:8080",
 }
 
 function Matrix:init()
-    -- Load saved channels configuration from settings/matrix.lua
     self.settings_file = DataStorage:getSettingsDir() .. "/matrix.lua"
     self.settings = LuaSettings:open(self.settings_file)
 
@@ -73,11 +71,9 @@ function Matrix:getActiveChannel()
     return self.channels[self.active_channel_idx] or self.channels[1]
 end
 
--- Build KOReader Menu
 function Matrix:addToMainMenu(menu_items)
     local plugin = self
 
-    -- Dynamically generate the list of channels
     local channel_sub_items = {}
     for idx, ch in ipairs(plugin.channels) do
         local prefix = (idx == plugin.active_channel_idx) and "✓ " or "   "
@@ -94,9 +90,9 @@ function Matrix:addToMainMenu(menu_items)
         })
     end
 
-    -- Option to add a new channel
+    -- Clarified that this handles invites too (via daemon's /rooms/join)
     table.insert(channel_sub_items, {
-        text = _("+ Add New Room"),
+        text = _("+ Join Room / Accept Invite"),
         callback = function()
             plugin:promptAddChannel()
         end,
@@ -106,6 +102,41 @@ function Matrix:addToMainMenu(menu_items)
         text = _("Matrix"),
         sorting_hint = "tools",
         sub_item_table = {
+            {
+                text = _("Test Daemon Connection"),
+                callback = function()
+                    plugin:testDaemonConnection()
+                end,
+            },
+            {
+                text = _("Authentication"),
+                sub_item_table = {
+                    {
+                        text = _("Login with Username & Password"),
+                        callback = function()
+                            plugin:promptLogin()
+                        end,
+                    },
+                    {
+                        text = _("Get SSO Login Link"),
+                        callback = function()
+                            plugin:promptSSO()
+                        end,
+                    },
+                    {
+                        text = _("Login with Access Token"), -- <-- NEW OPTION
+                        callback = function()
+                            plugin:promptTokenLogin()
+                        end,
+                    },
+                }
+            },
+            {
+                text = _("Auto-Sync Rooms & Contacts"),
+                callback = function()
+                    plugin:autoSyncRooms()
+                end,
+            },
             {
                 text = _("Active Room: ") .. plugin:getActiveChannel().name,
                 enabled = false,
@@ -132,95 +163,70 @@ function Matrix:addToMainMenu(menu_items)
                     plugin:promptRenameActiveChannel()
                 end,
             },
+            -- New menu item for leaving rooms
+            {
+                text = _("Leave Current Room"),
+                callback = function()
+                    plugin:promptLeaveActiveChannel()
+                end,
+            },
+            {
+                text = _("Check Invitations"),
+                callback = function()
+                    plugin:fetchAndShowInvites()
+                end,
+            },
         },
     }
 end
 
--- Query room display name from Matrix server with fallback chain
+-- Query room display name from the Daemon's /rooms endpoint
 function Matrix:fetchRoomName(room_id)
     if not room_id or room_id == "" then return nil end
 
-    local encoded_room = room_id:gsub("!", "%%21"):gsub("#", "%%23"):gsub(":", "%%3A")
-    local token = self.access_token
-
-    -- Step 1: Try fetching explicit m.room.name
-    local url_name = string.format("%s/_matrix/client/v3/rooms/%s/state/m.room.name", 
-        self.homeserver, encoded_room)
-    local body_name = {}
+    local url = self.daemon_url .. "/rooms"
+    local body = {}
 
     socketutil:set_timeout(5, 5)
-    local res1, code1 = https.request{
-        url = url_name,
+    local res, code = http.request{
+        url = url,
         method = "GET",
-        headers = { ["Authorization"] = "Bearer " .. token },
-        sink = ltn12.sink.table(body_name),
+        sink = ltn12.sink.table(body),
     }
     socketutil:reset_timeout()
 
-    if res1 and code1 == 200 then
-        local ok, parsed = pcall(rapidjson.decode, table.concat(body_name))
-        if ok and parsed and parsed.name and parsed.name ~= "" then
-            return parsed.name
+    if res and code == 200 then
+        local ok, parsed = pcall(rapidjson.decode, table.concat(body))
+        if ok and parsed then
+            for _, room in ipairs(parsed) do
+                if room.room_id == room_id and room.name then
+                    return room.name
+                end
+            end
         end
     end
 
-    -- Step 2: Fallback to m.room.canonical_alias if no explicit name is set
-    local url_alias = string.format("%s/_matrix/client/v3/rooms/%s/state/m.room.canonical_alias", 
-        self.homeserver, encoded_room)
-    local body_alias = {}
-
-    socketutil:set_timeout(5, 5)
-    local res2, code2 = https.request{
-        url = url_alias,
-        method = "GET",
-        headers = { ["Authorization"] = "Bearer " .. token },
-        sink = ltn12.sink.table(body_alias),
-    }
-    socketutil:reset_timeout()
-
-    if res2 and code2 == 200 then
-        local ok, parsed = pcall(rapidjson.decode, table.concat(body_alias))
-        if ok and parsed and parsed.alias and parsed.alias ~= "" then
-            return parsed.alias
-        end
-    end
-
-    -- Step 3: Final fallback to raw room_id
     return room_id
 end
 
--- Fetch recent messages from the active Matrix room
-function Matrix:fetchRoomMessages(limit)
-    limit = limit or 20
+-- Fetch messages from the Daemon and filter by the active channel
+function Matrix:fetchRoomMessages()
     local response_body = {}
     local active_ch = self:getActiveChannel()
-    
-    local token = active_ch.access_token or self.access_token
     local room_id = active_ch.room_id
 
-    if not token or token == "" or token == "YOUR_ACCESS_TOKEN" then
-        return nil, _("Missing Access Token in plugin settings.")
-    end
     if not room_id or room_id == "" then
         return nil, _("Missing Room ID for active channel.")
     end
 
-    local encoded_room = room_id:gsub("!", "%%21"):gsub("#", "%%23"):gsub(":", "%%3A")
-    local url = string.format("%s/_matrix/client/v3/rooms/%s/messages?limit=%d", 
-        self.homeserver, encoded_room, limit)
+    local url = self.daemon_url .. "/messages"
 
     socketutil:set_timeout(5, 5)
-
-    local res, code, headers, status = https.request{
+    local res, code, headers, status = http.request{
         url = url,
         method = "GET",
-        headers = {
-            ["Authorization"] = "Bearer " .. token,
-            ["Content-Type"] = "application/json",
-        },
         sink = ltn12.sink.table(response_body),
     }
-
     socketutil:reset_timeout()
 
     if not res or not code then
@@ -230,81 +236,41 @@ function Matrix:fetchRoomMessages(limit)
     local raw_data = table.concat(response_body)
 
     if code ~= 200 then
-        return nil, string.format("Matrix Server HTTP %s Error:\n%s", tostring(code), raw_data)
+        return nil, string.format("Daemon HTTP %s Error:\n%s", tostring(code), raw_data)
     end
 
     local ok, parsed = pcall(rapidjson.decode, raw_data)
-    if not ok or not parsed or not parsed.chunk then
+    if not ok or type(parsed) ~= "table" then
         return nil, string.format("Failed to parse JSON response:\n%s", raw_data)
     end
 
-    return parsed.chunk, nil
+    -- The daemon returns a flat list of messages for all rooms. Filter for the active one.
+    local filtered_messages = {}
+    for _, msg in ipairs(parsed) do
+        if msg.room_id == room_id then
+            table.insert(filtered_messages, msg)
+        end
+    end
+
+    return filtered_messages, nil
 end
--- Helper function to convert ISO 8601 / Unix timestamps into readable times
-local function formatTimestamp(origin_server_ts)
-    if not origin_server_ts then return "" end
-    -- Matrix timestamps are in milliseconds; convert to seconds for os.date
-    local sec = math.floor(origin_server_ts / 1000)
+
+local function formatTimestamp(timestamp_ms)
+    if not timestamp_ms then return "" end
+    local sec = math.floor(timestamp_ms / 1000)
     return os.date("%H:%M", sec)
 end
--- Helper: Send an m.reaction event to Matrix
-function Matrix:sendReaction(event_id, emoji)
-    local active_ch = self:getActiveChannel()
-    local token = active_ch.access_token or self.access_token
-    local room_id = active_ch.room_id
 
-    local txn_id = string.format("react_%d_%d", os.time(), math.random(100, 999))
-    local encoded_room = room_id:gsub("!", "%%21"):gsub("#", "%%23"):gsub(":", "%%3A")
-    local url = string.format("%s/_matrix/client/v3/rooms/%s/send/m.reaction/%s", 
-        self.homeserver, encoded_room, txn_id)
-
-    local payload = rapidjson.encode({
-        ["m.relates_to"] = {
-            rel_type = "m.annotation",
-            event_id = event_id,
-            key = emoji,
-        }
-    })
-
-    socketutil:set_timeout(5, 5)
-    local response_body = {}
-    local res, code = https.request{
-        url = url,
-        method = "PUT",
-        headers = {
-            ["Authorization"] = "Bearer " .. token,
-            ["Content-Type"] = "application/json",
-            ["Content-Length"] = tostring(#payload),
-        },
-        source = ltn12.source.string(payload),
-        sink = ltn12.sink.table(response_body),
-    }
-    socketutil:reset_timeout()
-
-    if res and code == 200 then
-        UIManager:show(InfoMessage:new{
-            text = string.format(_("Reacted with %s"), emoji),
-            timeout = 1.5,
-        })
-    else
-        UIManager:show(InfoMessage:new{
-            text = _("Failed to send reaction."),
-            timeout = 2,
-        })
-    end
-end
--- Fetch recent room events, aggregate reactions using shortcodes, and display in a KOReader Menu
 function Matrix:fetchAndShowMessages()
     local ButtonDialog = require("ui/widget/buttondialog")
-    local Menu = require("ui/widget/menu")
-
     local active_ch = self:getActiveChannel()
+    
     local loading = InfoMessage:new{ 
         text = string.format(_("Fetching messages for %s..."), active_ch.name) 
     }
     UIManager:show(loading)
 
-    local chunk, err = self:fetchRoomMessages(40)
+    local messages, err = self:fetchRoomMessages()
     UIManager:close(loading)
 
     if err then
@@ -312,140 +278,42 @@ function Matrix:fetchAndShowMessages()
         return
     end
 
-    -- 1. Pass One: Aggregate reactions by parent message event_id
-    local reactions_map = {} -- { [event_id] = { [emoji_key] = count } }
-    for _, event in ipairs(chunk or {}) do
-        if event.type == "m.reaction" and event.content and event.content["m.relates_to"] then
-            local relates = event.content["m.relates_to"]
-            local parent_id = relates.event_id
-            local key = relates.key
-
-            if parent_id and key then
-                reactions_map[parent_id] = reactions_map[parent_id] or {}
-                reactions_map[parent_id][key] = (reactions_map[parent_id][key] or 0) + 1
-            end
-        end
-    end
-
-    -- 2. Pass Two: Build paged menu items with sanitized shortcodes
     local menu_items = {}
-    for i = #(chunk or {}), 1, -1 do
-        local event = chunk[i]
-        if event.type == "m.room.message" and event.content and event.content.body then
-            local event_id = event.event_id
-            local sender = event.sender or "Unknown"
-            local short_sender = sender:match("@([^:]+)") or sender
-            
-            -- Sanitize incoming message body emojis into shortcodes
-            local clean_body = sanitizeEmojiText(event.content.body)
-            local time_str = formatTimestamp(event.origin_server_ts)
+    -- Display newest messages at the top
+    for i = #messages, 1, -1 do
+        local msg = messages[i]
+        local short_sender = msg.sender:match("@([^:]+)") or msg.sender
+        local clean_body = sanitizeEmojiText(msg.body)
+        local time_str = formatTimestamp(msg.timestamp_ms)
 
-            -- Format reaction line using shortcodes (e.g., ":thumbsup: 2   :heart: 1")
-            local rx_str = ""
-            if event_id and reactions_map[event_id] then
-                local rx_list = {}
-                for emoji_key, count in pairs(reactions_map[event_id]) do
-                    local display_key = sanitizeEmojiText(emoji_key)
-                    table.insert(rx_list, string.format("%s %d", display_key, count))
-                end
-                if #rx_list > 0 then
-                    rx_str = "\n" .. table.concat(rx_list, "   ")
-                end
-            end
+        local item_text = string.format("%s  •  %s\n%s", short_sender, time_str, clean_body)
 
-            local item_text = string.format("%s  •  %s\n%s%s", short_sender, time_str, clean_body, rx_str)
-
-            -- Inside Matrix:fetchAndShowMessages() where individual menu items are built:
-            table.insert(menu_items, {
-                text = item_text,
-                callback = function()
-                    local ButtonDialog = require("ui/widget/buttondialog")
-                    local dialog
-                    dialog = ButtonDialog:new{
-                        title = string.format(_("Message from %s"), short_sender),
-                        text = string.format("%s\n\n%s", clean_body, rx_str ~= "" and ("Reactions: " .. rx_str) or ""),
-                        buttons = {
+        table.insert(menu_items, {
+            text = item_text,
+            callback = function()
+                local dialog
+                dialog = ButtonDialog:new{
+                    title = string.format(_("Message from %s"), short_sender),
+                    text = clean_body,
+                    buttons = {
+                        {
                             {
-                                {
-                                    text = _("Reply"),
-                                    callback = function()
-                                        UIManager:close(dialog)
-                            
-                            -- Open keyboard input dialog for the reply
-                                        local input_dialog
-                                        input_dialog = InputDialog:new{
-                                            title = string.format(_("Reply to %s"), short_sender),
-                                            input = "",
-                                            save_callback = function(reply_text)
-                                                UIManager:close(input_dialog)
-
-                                                if not reply_text or reply_text:match("^%s*$") then
-                                                    return
-                                                end
-
-                                                local loading = InfoMessage:new{ text = _("Sending reply...") }
-                                                UIManager:show(loading)
-
-                                                -- Use the original message body for the reply fallback (guard if missing)
-                                                local original_body = (event and event.content and event.content.body) and event.content.body or ""
-                                                -- Trim whitespace from fallback so it doesn't produce ">  " etc.
-                                                original_body = original_body:gsub("^[ \t\r\n]+", ""):gsub("[ \t\r\n]+$", "")
-                                                -- Create plain-text fallback as a blockquote without angle brackets
-                                                local ok, err = self:sendRoomMessage(reply_text, event_id, original_body)
-                                                UIManager:close(loading)
-
-                                                if not ok then
-                                                    UIManager:show(InfoMessage:new{
-                                                        text = _("Failed to send reply:\n") .. err,
-                                                    })
-                                                else
-                                                    UIManager:show(InfoMessage:new{
-                                                        text = _("Reply sent successfully!"),
-                                                        timeout = 2,
-                                                    })
-                                                end
-                                            end,
-                                        }
-                                        UIManager:show(input_dialog)
-                                        input_dialog:onShowKeyboard()
-                                    end,
-                                },
-                            },
-                            {
-                                {
-                                    text = "👍 :thumbsup:",
-                                    callback = function()
-                                        UIManager:close(dialog)
-                                        self:sendReaction(event_id, "👍")
-                                    end,
-                                },
-                                {
-                                    text = "❤️ :heart:",
-                                    callback = function()
-                                        UIManager:close(dialog)
-                                        self:sendReaction(event_id, "❤️")
-                                    end,
-                                },
-                            },
-                            {
-                                {
-                                    text = _("Close"),
-                                    callback = function()
-                                        UIManager:close(dialog)
-                                    end,
-                                }
+                                text = _("Close"),
+                                callback = function()
+                                    UIManager:close(dialog)
+                                end,
                             }
-                        },
-                    }
-                    UIManager:show(dialog)
-                end,
-            })
-        end
+                        }
+                    },
+                }
+                UIManager:show(dialog)
+            end,
+        })
     end
 
     if #menu_items == 0 then
         table.insert(menu_items, {
-            text = _("No recent text messages found in this room."),
+            text = _("No recent messages found in this room."),
             enabled = false,
         })
     end
@@ -458,60 +326,35 @@ function Matrix:fetchAndShowMessages()
 
     UIManager:show(message_menu)
 end
--- Send a text message (optionally as a reply to another message)
-function Matrix:sendRoomMessage(text, reply_to_event_id, reply_to_body)
+
+-- Send a text message via the Daemon's /send endpoint
+function Matrix:sendRoomMessage(text)
     if not text or text:match("^%s*$") then
         return nil, _("Message cannot be empty.")
     end
 
     local response_body = {}
     local active_ch = self:getActiveChannel()
-    local token = active_ch.access_token or self.access_token
     local room_id = active_ch.room_id
 
-    local txn_id = string.format("koreader_%d", os.time())
-    local encoded_room = room_id:gsub("!", "%%21"):gsub("#", "%%23"):gsub(":", "%%3A")
-    local url = string.format("%s/_matrix/client/v3/rooms/%s/send/m.room.message/%s", 
-        self.homeserver, encoded_room, txn_id)
+    local url = self.daemon_url .. "/send"
 
-    -- Build base message payload
-    local payload_data = {
-        msgtype = "m.text",
-        body = text,
-    }
-
-    -- If replying, add Matrix reply metadata & plain-text fallback block
-    if reply_to_event_id and reply_to_body then
-        -- Clean reply body of newlines for the plain text fallback header
-        local clean_fallback = reply_to_body:gsub("[\r\n]+", " ")
-        clean_fallback = clean_fallback:gsub("^[ \t]+", ""):gsub("[ \t]+$", "")
-        if #clean_fallback > 60 then clean_fallback = clean_fallback:sub(1, 57) .. "..." end
-
-        payload_data.body = text
-
-        payload_data["m.relates_to"] = {
-            ["m.in_reply_to"] = {
-                event_id = reply_to_event_id
-            }
-        }
-    end
-
-    local payload = rapidjson.encode(payload_data)
+    local payload = rapidjson.encode({
+        room_id = room_id,
+        message = text,
+    })
 
     socketutil:set_timeout(5, 5)
-
-    local res, code, headers, status = https.request{
+    local res, code, headers, status = http.request{
         url = url,
-        method = "PUT",
+        method = "POST",
         headers = {
-            ["Authorization"] = "Bearer " .. token,
             ["Content-Type"] = "application/json",
             ["Content-Length"] = tostring(#payload),
         },
         source = ltn12.source.string(payload),
         sink = ltn12.sink.table(response_body),
     }
-
     socketutil:reset_timeout()
 
     if not res or not code then
@@ -520,13 +363,12 @@ function Matrix:sendRoomMessage(text, reply_to_event_id, reply_to_body)
 
     if code ~= 200 then
         local raw_data = table.concat(response_body)
-        return nil, string.format("Matrix Server HTTP %s Error:\n%s", tostring(code), raw_data)
+        return nil, string.format("Daemon HTTP %s Error:\n%s", tostring(code), raw_data)
     end
 
     return true, nil
 end
 
--- Open input dialog for sending message
 function Matrix:promptSendMessage()
     local active_ch = self:getActiveChannel()
     local input_dialog
@@ -537,9 +379,7 @@ function Matrix:promptSendMessage()
             UIManager:close(input_dialog)
 
             if not text or text:match("^%s*$") then
-                UIManager:show(InfoMessage:new{
-                    text = _("Cannot send empty message."),
-                })
+                UIManager:show(InfoMessage:new{ text = _("Cannot send empty message.") })
                 return
             end
 
@@ -550,9 +390,7 @@ function Matrix:promptSendMessage()
             UIManager:close(loading)
 
             if not ok then
-                UIManager:show(InfoMessage:new{
-                    text = _("Failed to send message:\n") .. err,
-                })
+                UIManager:show(InfoMessage:new{ text = _("Failed to send message:\n") .. err })
             else
                 UIManager:show(InfoMessage:new{
                     text = _("Message sent successfully!"),
@@ -565,7 +403,6 @@ function Matrix:promptSendMessage()
     input_dialog:onShowKeyboard()
 end
 
--- Prompt user for Room ID, fetch server name, then allow editing before saving
 function Matrix:promptAddChannel()
     local id_dialog
     id_dialog = InputDialog:new{
@@ -575,8 +412,22 @@ function Matrix:promptAddChannel()
             UIManager:close(id_dialog)
             if not room_id or room_id:match("^%s*$") then return end
 
-            local loading = InfoMessage:new{ text = _("Fetching room name from server...") }
+            local loading = InfoMessage:new{ text = _("Fetching room name...") }
             UIManager:show(loading)
+
+            -- Automatically join the room via the daemon
+            local join_body = {}
+            local join_payload = rapidjson.encode({ room_id = room_id })
+            http.request{
+                url = self.daemon_url .. "/rooms/join",
+                method = "POST",
+                headers = {
+                    ["Content-Type"] = "application/json",
+                    ["Content-Length"] = tostring(#join_payload),
+                },
+                source = ltn12.source.string(join_payload),
+                sink = ltn12.sink.table(join_body),
+            }
 
             local server_name = self:fetchRoomName(room_id)
             UIManager:close(loading)
@@ -587,10 +438,7 @@ function Matrix:promptAddChannel()
                 input = server_name,
                 save_callback = function(final_name)
                     UIManager:close(name_dialog)
-                    
-                    if not final_name or final_name:match("^%s*$") then
-                        final_name = server_name
-                    end
+                    if not final_name or final_name:match("^%s*$") then final_name = server_name end
 
                     table.insert(self.channels, {
                         name = final_name,
@@ -613,7 +461,6 @@ function Matrix:promptAddChannel()
     id_dialog:onShowKeyboard()
 end
 
--- Rename the active channel
 function Matrix:promptRenameActiveChannel()
     local active_ch = self:getActiveChannel()
     local rename_dialog
@@ -635,6 +482,402 @@ function Matrix:promptRenameActiveChannel()
     }
     UIManager:show(rename_dialog)
     rename_dialog:onShowKeyboard()
+end
+-- Leave the currently active room
+function Matrix:promptLeaveActiveChannel()
+    local active_ch = self:getActiveChannel()
+    
+    -- Prevent the user from leaving their last configured room
+    if #self.channels <= 1 then
+        UIManager:show(InfoMessage:new{ 
+            text = _("Cannot leave the only remaining room in your list."),
+            timeout = 3
+        })
+        return
+    end
+
+    local confirm = ConfirmBox:new{
+        text = string.format(_("Are you sure you want to leave and remove '%s'?"), active_ch.name),
+        ok_callback = function()
+            local loading = InfoMessage:new{ text = _("Leaving room...") }
+            UIManager:show(loading)
+
+            local payload = rapidjson.encode({ room_id = active_ch.room_id })
+            local response_body = {}
+            
+            socketutil:set_timeout(5, 5)
+            local res, code = http.request{
+                url = self.daemon_url .. "/rooms/leave",
+                method = "POST",
+                headers = {
+                    ["Content-Type"] = "application/json",
+                    ["Content-Length"] = tostring(#payload),
+                },
+                source = ltn12.source.string(payload),
+                sink = ltn12.sink.table(response_body),
+            }
+            socketutil:reset_timeout()
+            
+            UIManager:close(loading)
+
+            if res and code == 200 then
+                -- Remove the channel from the local Lua settings
+                table.remove(self.channels, self.active_channel_idx)
+                -- Safely revert to the first channel in the list
+                self.active_channel_idx = 1
+                self:savePluginSettings()
+
+                UIManager:show(InfoMessage:new{
+                    text = _("Left room successfully."),
+                    timeout = 2,
+                })
+            else
+                UIManager:show(InfoMessage:new{
+                    text = _("Failed to leave room. HTTP Code: ") .. tostring(code),
+                    timeout = 3,
+                })
+            end
+        end,
+    }
+    UIManager:show(confirm)
+end
+-- Standard Username and Password Login
+function Matrix:promptLogin()
+    local user_dialog
+    user_dialog = InputDialog:new{
+        title = _("Matrix Username\n(e.g., @user:matrix.org)"),
+        input = "",
+        save_callback = function(username)
+            UIManager:close(user_dialog)
+            if not username or username:match("^%s*$") then return end
+
+            local pass_dialog
+            pass_dialog = InputDialog:new{
+                title = _("Matrix Password"),
+                input = "",
+                is_password = true, -- Masks text on supported KOReader versions
+                save_callback = function(password)
+                    UIManager:close(pass_dialog)
+                    if not password or password:match("^%s*$") then return end
+
+                    local loading = InfoMessage:new{ text = _("Authenticating with Daemon...") }
+                    UIManager:show(loading)
+
+                    local payload = rapidjson.encode({
+                        username = username,
+                        password = password
+                    })
+                    local response_body = {}
+                    
+                    socketutil:set_timeout(15, 15)
+                    local res, code = http.request{
+                        url = self.daemon_url .. "/auth/login",
+                        method = "POST",
+                        headers = {
+                            ["Content-Type"] = "application/json",
+                            ["Content-Length"] = tostring(#payload),
+                        },
+                        source = ltn12.source.string(payload),
+                        sink = ltn12.sink.table(response_body),
+                    }
+                    socketutil:reset_timeout()
+                    UIManager:close(loading)
+
+                    if res and code == 200 then
+                        UIManager:show(InfoMessage:new{
+                            text = _("Login successful! Daemon is now syncing."),
+                            timeout = 3,
+                        })
+                    else
+                        UIManager:show(InfoMessage:new{
+                            text = string.format(_("Login failed.\nHTTP Code: %s"), tostring(code)),
+                            timeout = 4,
+                        })
+                    end
+                end,
+            }
+            UIManager:show(pass_dialog)
+            pass_dialog:onShowKeyboard()
+        end,
+    }
+    UIManager:show(user_dialog)
+    user_dialog:onShowKeyboard()
+end
+
+-- Fallback: Fetch SSO URL for browser login (Google/GitHub/Apple)
+function Matrix:promptSSO()
+    local loading = InfoMessage:new{ text = _("Fetching SSO Link...") }
+    UIManager:show(loading)
+
+    local response_body = {}
+    socketutil:set_timeout(5, 5)
+    local res, code = http.request{
+        url = self.daemon_url .. "/auth/sso/url",
+        method = "GET",
+        sink = ltn12.sink.table(response_body),
+    }
+    socketutil:reset_timeout()
+    UIManager:close(loading)
+
+    if res and code == 200 then
+        local url = table.concat(response_body) -- <-- THIS LINE WAS MISSING
+        UIManager:show(InfoMessage:new{
+            text = string.format(_("Please open this SSO link in a browser:\n\n%s"), url),
+        })
+    else
+        UIManager:show(InfoMessage:new{ 
+            text = _("Failed to retrieve SSO link from daemon."), 
+            timeout = 3 
+        })
+    end
+end
+-- Fetch and display pending room invitations with options to accept
+function Matrix:fetchAndShowInvites()
+    local ButtonDialog = require("ui/widget/buttondialog")
+    local loading = InfoMessage:new{ text = _("Checking for invitations...") }
+    UIManager:show(loading)
+
+    local response_body = {}
+    socketutil:set_timeout(5, 5)
+    local res, code = http.request{
+        url = self.daemon_url .. "/invites",
+        method = "GET",
+        sink = ltn12.sink.table(response_body),
+    }
+    socketutil:reset_timeout()
+    UIManager:close(loading)
+
+    if not res or code ~= 200 then
+        UIManager:show(InfoMessage:new{ text = _("Failed to fetch invitations."), timeout = 3 })
+        return
+    end
+
+    local ok, invites = pcall(rapidjson.decode, table.concat(response_body))
+    if not ok or type(invites) ~= "table" or #invites == 0 then
+        UIManager:show(InfoMessage:new{ text = _("No pending invitations found."), timeout = 3 })
+        return
+    end
+
+    -- Create an interactive menu or dialog for the first pending invite found
+    local invite = invites[1]
+    local room_name = invite.name or invite.room_id
+
+    local dialog
+    dialog = ButtonDialog:new{
+        title = _("Pending Room Invitation"),
+        text = string.format(_("You are invited to:\n%s\n(%s)"), room_name, invite.room_id),
+        buttons = {
+            {
+                {
+                    text = _("Accept Invite"),
+                    callback = function()
+                        UIManager:close(dialog)
+                        local load_join = InfoMessage:new{ text = _("Accepting invite...") }
+                        UIManager:show(load_join)
+
+                        local payload = rapidjson.encode({ room_id = invite.room_id })
+                        local join_body = {}
+                        local j_res, j_code = http.request{
+                            url = self.daemon_url .. "/rooms/join",
+                            method = "POST",
+                            headers = {
+                                ["Content-Type"] = "application/json",
+                                ["Content-Length"] = tostring(#payload),
+                            },
+                            source = ltn12.source.string(payload),
+                            sink = ltn12.sink.table(join_body),
+                        }
+                        UIManager:close(load_join)
+
+                        if j_res and j_code == 200 then
+                            -- Automatically add it to local channels list
+                            table.insert(self.channels, {
+                                name = room_name,
+                                room_id = invite.room_id,
+                            })
+                            self.active_channel_idx = #self.channels
+                            self:savePluginSettings()
+
+                            UIManager:show(InfoMessage:new{
+                                text = _("Invite accepted! Switched to room."),
+                                timeout = 3,
+                            })
+                        else
+                            UIManager:show(InfoMessage:new{
+                                text = _("Failed to accept invitation."),
+                                timeout = 3,
+                            })
+                        end
+                    end,
+                },
+                {
+                    text = _("Close"),
+                    callback = function()
+                        UIManager:close(dialog)
+                    end,
+                },
+            }
+        },
+    }
+    UIManager:show(dialog)
+end
+-- Fetch all rooms from daemon and automatically populate missing entries into KOReader settings
+function Matrix:autoSyncRooms()
+    local loading = InfoMessage:new{ text = _("Fetching all rooms and contacts...") }
+    UIManager:show(loading)
+
+    local response_body = {}
+    socketutil:set_timeout(5, 5)
+    local res, code = http.request{
+        url = self.daemon_url .. "/rooms/all",
+        method = "GET",
+        sink = ltn12.sink.table(response_body),
+    }
+    socketutil:reset_timeout()
+    UIManager:close(loading)
+
+    if not res or code ~= 200 then
+        UIManager:show(InfoMessage:new{ text = _("Failed to sync rooms from daemon."), timeout = 3 })
+        return
+    end
+
+    local ok, fetched_rooms = pcall(rapidjson.decode, table.concat(response_body))
+    if not ok or type(fetched_rooms) ~= "table" then
+        UIManager:show(InfoMessage:new{ text = _("Failed to parse rooms response."), timeout = 3 })
+        return
+    end
+
+    local added_count = 0
+
+    -- Loop through daemon rooms and append any that aren't already saved locally
+    for _, server_room in ipairs(fetched_rooms) do
+        local room_id = server_room.room_id
+        local room_name = server_room.name or room_id
+
+        local exists = false
+        for _, local_ch in ipairs(self.channels) do
+            if local_ch.room_id == room_id then
+                exists = true
+                -- Update name if it changed on the server
+                local_ch.name = room_name
+                break
+            end
+        end
+
+        if not exists then
+            table.insert(self.channels, {
+                name = room_name,
+                room_id = room_id,
+            })
+            added_count = added_count + 1
+        end
+    end
+
+    self:savePluginSettings()
+    -- Ensure settings are flushed to storage immediately
+    if G_settings then
+        G_settings:save()
+    end
+
+    -- If no active channel is currently set and we added rooms, default to the first one
+    if (not self.active_channel_idx or self.active_channel_idx == 0) and #self.channels > 0 then
+        self.active_channel_idx = 1
+    end
+
+    UIManager:show(InfoMessage:new{
+        text = string.format(_("Sync complete! Added %d new rooms/contacts."), added_count),
+        timeout = 3,
+    })
+end
+
+-- Test if the local Rust daemon is up and running
+function Matrix:testDaemonConnection()
+    local loading = InfoMessage:new{ text = _("Checking daemon status...") }
+    UIManager:show(loading)
+
+    local response_body = {}
+    socketutil:set_timeout(3, 3)
+    local res, code = http.request{
+        url = self.daemon_url .. "/health",
+        method = "GET",
+        sink = ltn12.sink.table(response_body),
+    }
+    socketutil:reset_timeout()
+    UIManager:close(loading)
+
+    if res and code == 200 then
+        UIManager:show(InfoMessage:new{
+            text = _("Success! Matrix daemon is running and online."),
+            timeout = 3,
+        })
+    else
+        UIManager:show(InfoMessage:new{
+            text = _("Connection failed. Is the Rust daemon running?"),
+            timeout = 4,
+        })
+    end
+end
+-- Login using an existing Matrix User ID and Access Token
+function Matrix:promptTokenLogin()
+    local user_dialog
+    user_dialog = InputDialog:new{
+        title = _("Matrix User ID\n(e.g., @user:mozilla.org)"),
+        input = "",
+        save_callback = function(user_id)
+            UIManager:close(user_dialog)
+            if not user_id or user_id:match("^%s*$") then return end
+
+            local token_dialog
+            token_dialog = InputDialog:new{
+                title = _("Matrix Access Token"),
+                input = "",
+                is_password = true,
+                save_callback = function(access_token)
+                    UIManager:close(token_dialog)
+                    if not access_token or access_token:match("^%s*$") then return end
+
+                    local loading = InfoMessage:new{ text = _("Restoring session via token...") }
+                    UIManager:show(loading)
+
+                    local payload = rapidjson.encode({
+                        user_id = user_id,
+                        access_token = access_token
+                    })
+                    local response_body = {}
+                    
+                    socketutil:set_timeout(10, 10)
+                    local res, code = http.request{
+                        url = self.daemon_url .. "/auth/token",
+                        method = "POST",
+                        headers = {
+                            ["Content-Type"] = "application/json",
+                            ["Content-Length"] = tostring(#payload),
+                        },
+                        source = ltn12.source.string(payload),
+                        sink = ltn12.sink.table(response_body),
+                    }
+                    socketutil:reset_timeout()
+                    UIManager:close(loading)
+
+                    if res and code == 200 then
+                        UIManager:show(InfoMessage:new{
+                            text = _("Session restored successfully! Daemon is now syncing."),
+                            timeout = 3,
+                        })
+                    else
+                        UIManager:show(InfoMessage:new{
+                            text = string.format(_("Token login failed.\nHTTP Code: %s"), tostring(code)),
+                            timeout = 4,
+                        })
+                    end
+                end,
+            }
+            UIManager:show(token_dialog)
+            token_dialog:onShowKeyboard()
+        end,
+    }
+    UIManager:show(user_dialog)
+    user_dialog:onShowKeyboard()
 end
 
 return Matrix
