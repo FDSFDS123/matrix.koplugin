@@ -1,18 +1,20 @@
 [package]
-name = "matrix-helper"
+name = "matrix-e2ee-daemon"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
-axum = "0.6"
+# Core matrix sdk
+matrix-sdk = { version = "0.7", default-features = false, features = ["e2e-encryption", "rustls-tls", "sqlite"] }
+
+# Force SQLite to be compiled from C source and bundled statically
+rusqlite = { version = "0.30.0", features = ["bundled"] }
+
+# Other dependencies
+ruma = "0.9"
+axum = "0.7"
+tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt"] }
-anyhow = "1.0"
-
-# matrix-rust-sdk: pick a version and enable encryption + a persistent store.
-# If the version you have in your environment uses different feature names, update accordingly.
-matrix-sdk = { version = "0.7", features = ["encryption", "sled_cryptostore", "reqwest_backend"] }
-ruma = "0.7"
+tracing-subscriber = "0.3"	
