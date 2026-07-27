@@ -107,6 +107,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Attempt to restore a previously-saved session (access token / device id / user id)
     if let Ok(saved) = fs::read_to_string("session.json").await {
+        // Try the current, expected matrix_sdk::Session format first
         match serde_json::from_str::<Session>(&saved) {
             Ok(sess) => {
                 if let Err(e) = client.restore_session(sess).await {
@@ -115,7 +116,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     info!("Restored session from disk");
                 }
             }
-            Err(e) => error!("Failed to parse saved session.json: {:?}", e),
+            Err(_) => {
+                // Fallback: older/alternate session JSON may only contain an access_token string
+                match serde_json::from_str::<serde_json::Value>(&saved) {
+                    Ok(val) => {
+                        if let Some(token) = val.get("access_token").and_then(|v| v.as_str()) {
+                            info!("Found access_token in saved session.json; attempting token login");
+                            match client.matrix_auth().login_token(token).send().await {
+                                Ok(_) => {
+                                    info!("Logged in via token from saved session.json");
+                                }
+                                Err(e) => {
+                                    error!("Failed token login from saved session.json: {:?}", e);
+                                }
+                            }
+                        } else {
+                            error!("Saved session.json is not a Session and contains no access_token");
+                        }
+                    }
+                    Err(e) => error!("Failed to parse saved session.json: {:?}", e),
+                }
+            }
         }
     }
 
