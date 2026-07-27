@@ -9,6 +9,76 @@ on:
 jobs:
   build-armhf-cross:
     runs-on: ubuntu-latest
+    env:
+      # Set a stable cargo cache key version so caches remain valid across runner image updates if needed
+      CARGO_CACHE_KEY: "v1"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v5
+
+      - name: Ensure Docker is available
+        run: |
+          echo "Checking Docker availability"
+          docker --version
+
+      - name: Set up rustup & stable toolchain on the runner (ensure cargo supports 2024 edition)
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Make sure rustup and toolchain are up-to-date (debug cargo version)
+        run: |
+          rustup self update || true
+          rustup update stable || true
+          rustup default stable || true
+          echo "Host cargo/rustc versions (should be recent enough for 2024 edition):"
+          cargo --version || true
+          rustc --version || true
+
+      - name: Cache cargo registry and target (optional, speeds up repeated runs)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ env.CARGO_CACHE_KEY }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.CARGO_CACHE_KEY }}-
+
+      - name: Build with cross (container image; run as root to avoid permission errors)
+        run: |
+          echo "Running cross build inside container image (as root)"
+          docker run --rm \
+            -v "${{ github.workspace }}":/work -w /work \
+            ghcr.io/cross-rs/cross:latest \
+            cross build --target armv7-unknown-linux-musleabihf --release
+          # Ensure artifacts are owned by the runner user (not root)
+          sudo chown -R $(id -u):$(id -g) target || true
+
+      - name: List produced artifacts
+        run: |
+          echo "Host workspace listing of built artifacts:"
+          ls -la target/release || true
+          file target/release/* || true
+
+      - name: Upload artifact (armhf musl)
+        uses: actions/upload-artifact@v5
+        with:
+          name: matrix-helper-linux-armhf-musl
+          path: target/release/*name: Build linux-armhf (armv7) with musl via cross (container)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-armhf-cross:
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repo
