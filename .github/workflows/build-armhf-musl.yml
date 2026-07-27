@@ -25,14 +25,15 @@ jobs:
           toolchain: stable
           override: true
 
-      - name: Build with cross (container image)
+      - name: Build with cross (container image; run as root to avoid permission errors)
         run: |
-          echo "Running cross build inside container image"
-          # Run cross container as current user to avoid permission issues with mounted files
-          docker run --rm -u $(id -u):$(id -g) \
+          echo "Running cross build inside container image (as root)"
+          docker run --rm \
             -v "${{ github.workspace }}":/work -w /work \
             ghcr.io/cross-rs/cross:latest \
             cross build --target armv7-unknown-linux-musleabihf --release
+          # Ensure artifacts are owned by the runner user (not root)
+          sudo chown -R $(id -u):$(id -g) target || true
 
       - name: List produced artifacts
         run: |
