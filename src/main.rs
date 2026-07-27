@@ -4,7 +4,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use matrix_sdk::{config::SyncSettings, Client, Room};
+use matrix_sdk::{config::SyncSettings, Client, Room, Session};
+use serde_json;
+use tokio::fs;
 use ruma::{
     events::room::message::{OriginalSyncRoomMessageEvent, RoomMessageEventContent},
     RoomId, RoomOrAliasId,
@@ -103,6 +105,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         message_store: message_store.clone(),
     };
 
+    // Attempt to restore a previously-saved session (access token / device id / user id)
+    if let Ok(saved) = fs::read_to_string("session.json").await {
+        match serde_json::from_str::<Session>(&saved) {
+            Ok(sess) => {
+                if let Err(e) = client.restore_session(sess).await {
+                    error!("Failed to restore session from disk: {:?}", e);
+                } else {
+                    info!("Restored session from disk");
+                }
+            }
+            Err(e) => error!("Failed to parse saved session.json: {:?}", e),
+        }
+    }
+
     if client.logged_in() {
         info!("Found existing session. Starting background sync for E2EE...");
         start_sync_loop(client.clone(), message_store);
@@ -172,6 +188,13 @@ async fn token_login_handler(
     match state.client.matrix_auth().login_token(&payload.access_token).send().await {
         Ok(_) => {
             info!("Session successfully authenticated via token! Starting background sync.");
+            // Persist session to disk
+            if let Some(session) = state.client.session().await {
+                if let Err(e) = fs::write("session.json", serde_json::to_string(&session).unwrap()).await {
+                    error!("Failed to persist session to disk: {:?}", e);
+                }
+            }
+
             start_sync_loop(state.client.clone(), state.message_store.clone());
             Ok(Json(StatusResponse { status: "logged_in".to_string() }))
         }
@@ -188,9 +211,19 @@ async fn login_handler(
 ) -> Result<Json<StatusResponse>, StatusCode> {
     info!("Attempting password login for user: {}", payload.username);
     
-    match state.client.matrix_auth().login_username(&payload.username, &payload.password).await {
+    match state.client.matrix_auth()
+        .login_username(&payload.username, &payload.password)
+        .initial_device_display_name("axum-daemon")
+        .send()
+        .await
+    {
         Ok(_) => {
-            info!("Password login successful! Starting background sync.");
+            info!("Password login successful! Saving session and starting background sync.");
+            if let Some(session) = state.client.session().await {
+                if let Err(e) = fs::write("session.json", serde_json::to_string(&session).unwrap()).await {
+                    error!("Failed to persist session to disk: {:?}", e);
+                }
+            }
             start_sync_loop(state.client.clone(), state.message_store.clone());
             Ok(Json(StatusResponse { status: "logged_in".to_string() }))
         }
@@ -261,9 +294,14 @@ async fn sso_callback_handler(
     Query(query): Query<SsoCallbackQuery>,
 ) -> Result<&'static str, StatusCode> {
     info!("Received SSO callback. Completing login...");
-    match state.client.matrix_auth().login_token(&query.loginToken).await {
+    match state.client.matrix_auth().login_token(&query.loginToken).send().await {
         Ok(_) => {
-            info!("Login successful! Starting background sync.");
+            info!("Login successful! Saving session and starting background sync.");
+            if let Some(session) = state.client.session().await {
+                if let Err(e) = fs::write("session.json", serde_json::to_string(&session).unwrap()).await {
+                    error!("Failed to persist session to disk: {:?}", e);
+                }
+            }
             start_sync_loop(state.client.clone(), state.message_store.clone());
             Ok("Login successful. You can close this window.")
         }
