@@ -1,4 +1,4 @@
-name: Build linux-armhf (armv7) with glibc < 2.20 via debootstrap + qemu
+name: Build linux-armhf (armv7) with musl via cross (container)
 
 on:
   workflow_dispatch:
@@ -7,142 +7,41 @@ on:
       - main
 
 jobs:
-  build-armhf-jessie-debootstrap:
+  build-armhf-cross:
     runs-on: ubuntu-latest
-    env:
-      TARGET: armv7-unknown-linux-gnueabihf
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v5
 
-      - name: Install host prerequisites (debootstrap, qemu)
+      - name: Ensure Docker is available
         run: |
-          sudo apt-get update -y
-          sudo apt-get install -y --no-install-recommends debootstrap qemu-user-static binfmt-support rsync
+          echo "Checking Docker availability"
+          docker --version
 
-      - name: Prepare armhf rootfs (Debian Jessie) with debootstrap
+      - name: Set up Rust (stable)
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Build with cross (container image)
         run: |
-          set -euo pipefail
-          ROOTFS="$RUNNER_TEMP/jessie-rootfs"
-          echo "Preparing rootfs at $ROOTFS"
-          sudo rm -rf "$ROOTFS"
-          sudo mkdir -p "$ROOTFS"
+          echo "Running cross build inside container image"
+          # Run cross container as current user to avoid permission issues with mounted files
+          docker run --rm -u $(id -u):$(id -g) \
+            -v "${{ github.workspace }}":/work -w /work \
+            ghcr.io/cross-rs/cross:latest \
+            cross build --target armv7-unknown-linux-musleabihf --release
 
-          # First-stage bootstrap for armhf; use archive.debian.org to get old packages
-          sudo debootstrap --arch=armhf --foreign jessie "$ROOTFS" http://archive.debian.org/debian || {
-            echo "debootstrap first-stage failed"
-            exit 2
-          }
-
-          # Copy qemu user static binary so the chroot can run ARM binaries under qemu
-          sudo cp /usr/bin/qemu-arm-static "$ROOTFS"/usr/bin/
-
-          # Bind-mount the repository into the rootfs at /work so builds write directly to the runner workspace
-          sudo mkdir -p "$ROOTFS"/work
-          sudo mount --bind "${GITHUB_WORKSPACE}" "$ROOTFS"/work
-          # Create a chroot build script on the runner (single-quoted here-doc to avoid host expansion),
-          # copy it into the rootfs, and execute it inside the chroot with qemu-arm-static.
-          CHROOT_SCRIPT="$RUNNER_TEMP/chroot-build.sh"
-          sudo rm -f "$CHROOT_SCRIPT"
-          sudo tee "$CHROOT_SCRIPT" > /dev/null <<'SH'
-#!/bin/bash
-set -euo pipefail
-
-# configure apt to use archive and ignore valid-until/signature checks (CI-only)
-echo 'deb http://archive.debian.org/debian jessie main contrib non-free' > /etc/apt/sources.list
-echo 'deb http://archive.debian.org/debian-security jessie/updates main contrib non-free' >> /etc/apt/sources.list
-echo 'deb http://archive.debian.org/debian jessie-updates main contrib non-free' >> /etc/apt/sources.list
-
-echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99allow-insecure
-echo 'Acquire::AllowInsecureRepositories "true";' >> /etc/apt/apt.conf.d/99allow-insecure
-echo 'Acquire::AllowDowngradeToInsecureRepositories "true";' >> /etc/apt/apt.conf.d/99allow-insecure
-echo 'APT::Get::AllowUnauthenticated "true";' >> /etc/apt/apt.conf.d/99allow-insecure
-
-# Finish debootstrap
-/debootstrap/debootstrap --second-stage || { echo 'debootstrap second-stage failed'; exit 3; }
-
-# update and install build deps (allow unauthenticated because signatures are expired)
-apt-get -o Acquire::Check-Valid-Until=false update -y || true
-apt-get install -y --allow-unauthenticated --no-install-recommends \
-  build-essential cmake git pkg-config curl ca-certificates libssl-dev python3 \
-  autoconf automake libtool gettext
-
-echo 'glibc version inside chroot:'
-ldd --version | head -n 1 || true
-
-# Build a modern CMake from source (Jessie's cmake is too old for libolm)
-CMAKE_VERSION=3.22.0
-echo "Building CMake ${CMAKE_VERSION} from source (this may take several minutes)..."
-rm -rf /tmp/cmake-src || true
-cd /tmp
-apt-get install -y --no-install-recommends libssl-dev || true
-curl -fsSL -o cmake.tar.gz https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}.tar.gz
-tar xf cmake.tar.gz
-cd cmake-${CMAKE_VERSION}
-./bootstrap --prefix=/usr/local || { echo "cmake bootstrap failed"; exit 5; }
-make -j$(nproc) || { echo "cmake make failed"; exit 6; }
-make install || { echo "cmake install failed"; exit 7; }
-/usr/local/bin/cmake --version || true
-
-# Build libolm (static)
-echo 'Cloning and building libolm...'
-rm -rf /tmp/olm || true
-git clone --depth 1 https://gitlab.matrix.org/matrix-org/olm.git /tmp/olm
-mkdir -p /tmp/olm/build
-cd /tmp/olm/build
-/usr/local/bin/cmake .. -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF
-make -j$(nproc)
-make install
-
-ls -la /usr/local/lib/libolm.a || true
-ls -la /usr/local/include/olm || true
-
-# Install rustup and Rust toolchain inside chroot (armhf)
-echo 'Installing rustup in chroot...'
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh
-chmod x /tmp/rustup-init.sh
-/tmp/rustup-init.sh -y --no-modify-path
-export PATH="/root/.cargo/bin:$PATH"
-rustup default stable || true
-
-# Build the Rust helper inside the chroot; repository is mounted at /work
-cd /work
-export LIBRARY_PATH=/usr/local/lib:$LIBRARY_PATH
-export LD_LIBRARY_PATH=/usr/local/lib:$LD_LIBRARY_PATH
-export C_INCLUDE_PATH=/usr/local/include:$C_INCLUDE_PATH
-DEP_FEATURES='matrix-sdk/encryption matrix-sdk/sled_cryptostore'
-echo 'Running cargo build (inside chroot) with dependency features:' $DEP_FEATURES
-if ! cargo build --release --features "$DEP_FEATURES"; then
-  echo 'cargo build FAILED inside chroot; printing diagnostics'
-  cargo tree || true
-  ls -la target || true
-  exit 4
-fi
-
-echo 'Build completed inside chroot; listing artifacts:'
-ls -la /work/target/release || true
-
-# Ensure produced artifacts in /work are world readable (host workspace mount)
-chmod -R ar /work/target/release || true
-SH
-
-          # Copy script into rootfs and run inside chroot
-          sudo cp "$CHROOT_SCRIPT" "$ROOTFS/root/chroot-build.sh"
-          sudo chmod x "$ROOTFS/root/chroot-build.sh"
-          sudo chroot "$ROOTFS" /usr/bin/qemu-arm-static /bin/bash /root/chroot-build.sh
-          # Unmount the workspace bind to avoid leaving mounts
-          sudo umount "$ROOTFS"/work || true
-          echo "Chroot build done; artifacts should be in ${GITHUB_WORKSPACE}/target/release"
-      
-      - name: List produced artifacts (host)
+      - name: List produced artifacts
         run: |
           echo "Host workspace listing of built artifacts:"
           ls -la target/release || true
           file target/release/* || true
 
-      - name: Upload artifact (armhf jessie / glibc < 2.20)
+      - name: Upload artifact (armhf musl)
         uses: actions/upload-artifact@v5
         with:
-          name: matrix-helper-linux-armhf-glibc-<2.20
+          name: matrix-helper-linux-armhf-musl
           path: target/release/*
