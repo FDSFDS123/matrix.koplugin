@@ -1,0 +1,52 @@
+name: Cross-Compile Linux Binaries
+
+on:
+  push:
+    tags:
+      - 'v*' # Triggers when you push a tag like v1.0.0
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 (Static Musl)
+          - target: x86_64-unknown-linux-musl
+            artifact_name: matrix-daemon-linux-x86_64
+
+          # Linux ARM64 / AArch64 (Raspberry Pi 4/5 64-bit, AWS Graviton, Apple Silicon VMs)
+          - target: aarch64-unknown-linux-gnu
+            artifact_name: matrix-daemon-linux-arm64
+
+          # Linux ARMhf / 32-bit ARM Hard Float (Raspberry Pi 2/3 32-bit OS, older embedded devices)
+          - target: armv7-unknown-linux-musleabihf
+            artifact_name: matrix-daemon-linux-armhf
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install Cross
+        run: cargo install cross --git https://github.com/cross-rs/cross
+
+      - name: Build with Cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Upload Binary Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: target/${{ matrix.target }}/release/matrix-daemon
+          if-no-files-found: error
