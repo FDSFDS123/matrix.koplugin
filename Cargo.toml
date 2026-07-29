@@ -1,0 +1,22 @@
+[package]
+name = "matrix-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = "0.8"
+tokio = { version = "1.38", features = ["full"] }
+
+# Matrix SDK with SQLite persistent storage feature
+matrix-sdk = { version = "0.18", features = ["sqlite", "e2e-encryption"] }
+ruma = "0.16"
+
+rusqlite = { version = "*", features = ["bundled"] }
+# Serialization & Deserialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Logging and Tracing
+tracing = "0.1"
+tracing-subscriber = "0.3"
