@@ -10,4 +10,4 @@ jobs:
     steps:
       - uses: iamazeem/delete-workflow-runs-action@v1
         with:
-          keep: 0 # Deletes everything
+          keep: 2 # Deletes everything
