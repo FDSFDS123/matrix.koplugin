@@ -22,7 +22,7 @@ jobs:
             artifact_name: matrix-daemon-linux-x86_64
 
           # Linux ARM64 / AArch64 (Raspberry Pi 4/5 64-bit, AWS Graviton, Apple Silicon VMs)
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             artifact_name: matrix-daemon-linux-arm64
 
           # Linux ARMhf / 32-bit ARM Hard Float (Raspberry Pi 2/3 32-bit OS, older embedded devices)
